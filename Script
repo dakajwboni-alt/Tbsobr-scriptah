@@ -1,0 +1,766 @@
+--=====================================================================
+--  HORROR MOD  •  client-side  •  v2 (combined + improved)
+--  Everything here runs locally, so it only affects YOUR screen.
+--  Replace the asset IDs in CONFIG.Sounds / CONFIG.JumpscareImage
+--  with your own uploads — the ones below are placeholders.
+--=====================================================================
+
+--=========================  SERVICES  ================================
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local Lighting         = game:GetService("Lighting")
+local SoundService     = game:GetService("SoundService")
+local TweenService     = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace        = game:GetService("Workspace")
+
+local LP     = Players.LocalPlayer
+local PGui   = LP:WaitForChild("PlayerGui")
+local Camera = Workspace.CurrentCamera
+
+--==========================  CONFIG  =================================
+local CONFIG = {
+	MonsterCount      = 2,
+	MonsterUserIds    = { 1, 2 },      -- avatar IDs used to build the figures
+	MonsterSpeed      = 11,
+	MonsterSightRange = 220,
+	CatchDistance     = 4.5,
+	RespawnDistance   = 150,           -- if a monster drifts this far, it relocates
+	RelocateMin       = 60,
+	RelocateMax       = 100,
+
+	FlickerMin = 7,  FlickerMax = 20,  -- seconds between light flickers
+	ScareMin   = 22, ScareMax   = 50,  -- seconds between random scare events
+
+	BatteryDrain     = 1.6,            -- % per second while the light is on
+	JumpscareHold    = 1.4,
+	FakeBanHold      = 3.0,
+
+	Sounds = {
+		Ambient   = "rbxassetid://1837879082",
+		Whisper   = "rbxassetid://130972023859746",
+		Scream    = "rbxassetid://5801257793",
+		Heartbeat = "rbxassetid://5236852545",
+		Chime     = "rbxassetid://6042053626",
+		Static    = "rbxassetid://131237241",
+	},
+	JumpscareImage = "rbxassetid://100670406768917",
+}
+
+--==========================  STATE  ==================================
+local Horror = {
+	running   = true,
+	caught    = false,
+	monsters  = {},
+	instances = {},          -- everything we create, for cleanup
+	lightingBackup = {},
+}
+local playerGuiRefs = {}
+
+local function track(inst)
+	table.insert(Horror.instances, inst)
+	return inst
+end
+
+--========================  UTILITIES  ================================
+local function newSound(id, volume, looped, parent)
+	local s = Instance.new("Sound")
+	s.SoundId = id
+	s.Volume  = volume or 1
+	s.Looped  = looped or false
+	s.Parent  = parent or SoundService
+	return track(s)
+end
+
+local function findGround(position, ignore)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = ignore or {}
+	local hit = Workspace:Raycast(position + Vector3.new(0, 120, 0), Vector3.new(0, -600, 0), params)
+	return hit and hit.Position or nil
+end
+
+local function randomAroundPlayer(minDist, maxDist)
+	local char = LP.Character
+	local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return nil end
+	local angle = math.random() * math.pi * 2
+	local dist  = minDist + math.random() * (maxDist - minDist)
+	return hrp.Position + Vector3.new(math.cos(angle) * dist, 0, math.sin(angle) * dist)
+end
+
+--======================  1. DARKNESS / ATMOSPHERE  ===================
+local function applyAtmosphere()
+	-- Back up whatever was there so we can restore it
+	for _, name in ipairs({ "HorrorColor", "HorrorBloom", "HorrorBlur", "HorrorAtmosphere" }) do
+		local existing = Lighting:FindFirstChild(name)
+		if existing then existing:Destroy() end
+	end
+
+	Horror.lightingBackup = {
+		ClockTime  = Lighting.ClockTime,
+		Brightness = Lighting.Brightness,
+		FogEnd     = Lighting.FogEnd,
+		FogStart   = Lighting.FogStart,
+		Ambient    = Lighting.Ambient,
+		OutdoorAmbient = Lighting.OutdoorAmbient,
+	}
+
+	Lighting.ClockTime      = 0
+	Lighting.Brightness     = 0.05
+	Lighting.FogEnd         = 55
+	Lighting.FogStart       = 8
+	Lighting.FogColor       = Color3.fromRGB(6, 6, 8)
+	Lighting.Ambient        = Color3.fromRGB(12, 12, 14)
+	Lighting.OutdoorAmbient = Color3.fromRGB(10, 10, 12)
+	Lighting.GlobalShadows  = true
+
+	local cc = Instance.new("ColorCorrectionEffect")
+	cc.Name       = "HorrorColor"
+	cc.Brightness = -0.32
+	cc.Contrast   = 0.25
+	cc.Saturation = -0.55
+	cc.TintColor  = Color3.fromRGB(190, 195, 210)
+	cc.Parent     = Lighting
+	track(cc)
+
+	local bloom = Instance.new("BloomEffect")
+	bloom.Name      = "HorrorBloom"
+	bloom.Intensity = 0.7
+	bloom.Size      = 18
+	bloom.Threshold = 1.4
+	bloom.Parent    = Lighting
+	track(bloom)
+
+	local blur = Instance.new("BlurEffect")
+	blur.Name    = "HorrorBlur"
+	blur.Size    = 4
+	blur.Parent  = Lighting
+	track(blur)
+
+	local atmo = Instance.new("Atmosphere")
+	atmo.Name        = "HorrorAtmosphere"
+	atmo.Density     = 0.42
+	atmo.Haze        = 2.5
+	atmo.Glare       = 0
+	atmo.Color       = Color3.fromRGB(20, 20, 24)
+	atmo.Decay       = Color3.fromRGB(10, 10, 12)
+	atmo.Parent      = Lighting
+	track(atmo)
+end
+
+--======================  2. AMBIENT AUDIO  ===========================
+local function startAmbience()
+	local ambient = newSound(CONFIG.Sounds.Ambient, 0.45, true, SoundService)
+	ambient:Play()
+
+	local heartbeat = newSound(CONFIG.Sounds.Heartbeat, 0, true, SoundService)
+	heartbeat:Play()
+	Horror.heartbeat = heartbeat
+end
+
+--======================  3. FLASHLIGHT TOOL  =========================
+local function giveFlashlight()
+	local backpack = LP:FindFirstChildOfClass("Backpack")
+	if not backpack then return end
+
+	local tool = Instance.new("Tool")
+	tool.Name           = "Flashlight"
+	tool.RequiresHandle = false
+	tool.CanBeDropped   = false
+	tool.ToolTip        = "Left-click or press F to toggle"
+	tool.Parent         = backpack
+	track(tool)
+
+	local state = { on = false, battery = 100, light = nil }
+
+	local function setLight(on)
+		local char = LP.Character
+		local head = char and char:FindFirstChild("Head")
+		if not head then return end
+
+		if on and not state.light then
+			local spot = Instance.new("SpotLight")
+			spot.Name       = "HorrorFlashlight"
+			spot.Angle      = 42
+			spot.Brightness = 2.6
+			spot.Range      = 55
+			spot.Face       = Enum.NormalId.Front
+			spot.Color      = Color3.fromRGB(255, 246, 220)
+			spot.Parent     = head
+			state.light = spot
+		elseif not on and state.light then
+			state.light:Destroy()
+			state.light = nil
+		end
+		state.on = on
+	end
+
+	tool.Equipped:Connect(function()
+		if state.battery > 0 then setLight(true) end
+	end)
+	tool.Unequipped:Connect(function()
+		setLight(false)
+	end)
+	tool.Activated:Connect(function()
+		if state.battery <= 0 then return end
+		setLight(not state.on)
+	end)
+
+	-- F key toggles while equipped
+	UserInputService.InputBegan:Connect(function(input, processed)
+		if processed then return end
+		if input.KeyCode == Enum.KeyCode.F and tool.Parent == LP.Character then
+			if state.battery <= 0 then return end
+			setLight(not state.on)
+		end
+	end)
+
+	-- Battery drain + flicker when a monster is near
+	task.spawn(function()
+		while Horror.running do
+			task.wait(0.1)
+			if state.on and state.battery > 0 then
+				state.battery = math.max(0, state.battery - CONFIG.BatteryDrain * 0.1)
+				if state.battery <= 0 then setLight(false) end
+
+				local nearest = math.huge
+				for _, m in ipairs(Horror.monsters) do
+					local root = m:FindFirstChild("HumanoidRootPart")
+					local char = LP.Character
+					local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+					if root and hrp then
+						nearest = math.min(nearest, (root.Position - hrp.Position).Magnitude)
+					end
+				end
+
+				if state.light then
+					if nearest < 35 then
+						-- panic flicker
+						state.light.Enabled = math.random() > 0.35
+						state.light.Brightness = 1.6 + math.random() * 1.6
+					else
+						state.light.Enabled = true
+						state.light.Brightness = 2.6
+					end
+				end
+			end
+		end
+	end)
+
+	-- Auto-equip once
+	task.defer(function()
+		local char = LP.Character or LP.CharacterAdded:Wait()
+		task.wait(0.5)
+		local humanoid = char:FindFirstChildOfClass("Humanoid")
+		if humanoid and tool.Parent == backpack then
+			humanoid:EquipTool(tool)
+		end
+	end)
+
+	Horror.flashlight = state
+end
+
+--======================  4. MONSTERS  ================================
+local function buildFallbackFigure()
+	local model = Instance.new("Model")
+	model.Name = "Figure"
+
+	local root = Instance.new("Part")
+	root.Name = "HumanoidRootPart"
+	root.Size = Vector3.new(2, 2, 1)
+	root.Transparency = 1
+	root.CanCollide = false
+	root.Parent = model
+
+	local torso = Instance.new("Part")
+	torso.Name = "Torso"
+	torso.Size = Vector3.new(2, 2, 1)
+	torso.BrickColor = BrickColor.new("Really black")
+	torso.Material = Enum.Material.SmoothPlastic
+	torso.Parent = model
+
+	local head = Instance.new("Part")
+	head.Name = "Head"
+	head.Shape = Enum.PartType.Ball
+	head.Size = Vector3.new(1.4, 1.4, 1.4)
+	head.BrickColor = BrickColor.new("Really black")
+	head.Material = Enum.Material.SmoothPlastic
+	head.Parent = model
+
+	local weld = Instance.new("WeldConstraint")
+	weld.Part0 = torso
+	weld.Part1 = head
+	weld.Parent = torso
+	head.CFrame = torso.CFrame * CFrame.new(0, 1.6, 0)
+
+	local humanoid = Instance.new("Humanoid")
+	humanoid.Parent = model
+	root.Parent = model
+
+	model.PrimaryPart = root
+	return model
+end
+
+local function buildFigure(userId)
+	local ok, model = pcall(function()
+		return Players:CreateHumanoidModelFromUserId(userId)
+	end)
+	if not ok or not model then
+		return buildFallbackFigure()
+	end
+
+	model.Name = "Figure"
+
+	-- Strip anything human-looking, paint it black
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BasePart") then
+			d.BrickColor   = BrickColor.new("Really black")
+			d.Material     = Enum.Material.SmoothPlastic
+			d.Transparency = 0
+			d.CanCollide   = true
+		elseif d:IsA("Decal") or d:IsA("Texture") or d:IsA("Accessory")
+			or d:IsA("Shirt") or d:IsA("Pants") or d:IsA("ShirtGraphic") then
+			d:Destroy()
+		end
+	end
+
+	if not model.PrimaryPart then
+		model.PrimaryPart = model:FindFirstChild("HumanoidRootPart")
+	end
+	return model
+end
+
+local function spawnMonster(userId)
+	local spawnPos = randomAroundPlayer(CONFIG.RelocateMin, CONFIG.RelocateMax)
+	if not spawnPos then return nil end
+
+	local model = buildFigure(userId)
+	if not model then return nil end
+
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		humanoid.MaxHealth = math.huge
+		humanoid.Health    = math.huge
+		humanoid.WalkSpeed = CONFIG.MonsterSpeed
+		humanoid.JumpPower = 0
+		humanoid.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+		humanoid.BreakJointsOnDeath  = false
+	end
+
+	local ground = findGround(spawnPos) or spawnPos
+	local root = model.PrimaryPart or model:FindFirstChild("HumanoidRootPart")
+	if root then
+		model:PivotTo(CFrame.new(ground + Vector3.new(0, 3, 0)))
+	end
+
+	model.Parent = Workspace
+	track(model)
+
+	-- Footstep / presence audio
+	local static = newSound(CONFIG.Sounds.Static, 0, true, model.PrimaryPart or model)
+	static:Play()
+	model:SetAttribute("StaticSound", static)
+
+	return model
+end
+
+local function relocateMonster(model)
+	local pos = randomAroundPlayer(CONFIG.RelocateMin, CONFIG.RelocateMax)
+	if not pos then return end
+	local ground = findGround(pos, { model }) or pos
+	model:PivotTo(CFrame.new(ground + Vector3.new(0, 3, 0)))
+end
+
+--======================  5. JUMPSCARE + FAKE BAN  ====================
+local function triggerCatch()
+	if Horror.caught or not Horror.running then return end
+	Horror.caught = true
+	Horror.running = false
+
+	-- Jumpscare overlay
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "HorrorJumpscare"
+	gui.IgnoreGuiInset = true
+	gui.ResetOnSpawn = false
+	gui.DisplayOrder = 999
+	gui.Parent = PGui
+
+	local img = Instance.new("ImageLabel")
+	img.Size = UDim2.fromScale(1, 1)
+	img.BackgroundTransparency = 1
+	img.Image = CONFIG.JumpscareImage
+	img.ScaleType = Enum.ScaleType.Crop
+	img.ImageTransparency = 1
+	img.Parent = gui
+
+	local scream = Instance.new("Sound")
+	scream.SoundId = CONFIG.Sounds.Scream
+	scream.Volume = 4
+	scream.Parent = gui
+	scream:Play()
+
+	-- Snap it in, jitter it, then fade out
+	TweenService:Create(img, TweenInfo.new(0.05), { ImageTransparency = 0 }):Play()
+
+	local jitterEnd = os.clock() + CONFIG.JumpscareHold
+	task.spawn(function()
+		while os.clock() < jitterEnd do
+			img.Position = UDim2.new(0, math.random(-25, 25), 0, math.random(-25, 25))
+			img.Rotation = math.random(-4, 4)
+			task.wait(0.02)
+		end
+		img.Position = UDim2.new(0, 0, 0, 0)
+		img.Rotation = 0
+	end)
+
+	-- Fake ban screen
+	task.delay(CONFIG.JumpscareHold, function()
+		gui:Destroy()
+
+		local ban = Instance.new("ScreenGui")
+		ban.Name = "HorrorBan"
+		ban.IgnoreGuiInset = true
+		ban.ResetOnSpawn = false
+		ban.DisplayOrder = 1000
+		ban.Parent = PGui
+
+		local bg = Instance.new("Frame")
+		bg.Size = UDim2.fromScale(1, 1)
+		bg.BackgroundColor3 = Color3.fromRGB(20, 20, 24)
+		bg.BorderSizePixel = 0
+		bg.Parent = ban
+
+		local title = Instance.new("TextLabel")
+		title.Size = UDim2.new(1, 0, 0, 60)
+		title.Position = UDim2.new(0, 0, 0.28, 0)
+		title.BackgroundTransparency = 1
+		title.Font = Enum.Font.GothamBold
+		title.TextSize = 44
+		title.TextColor3 = Color3.fromRGB(240, 240, 240)
+		title.Text = "Disconnected"
+		title.Parent = ban
+
+		local body = Instance.new("TextLabel")
+		body.Size = UDim2.new(0.8, 0, 0, 200)
+		body.Position = UDim2.new(0.1, 0, 0.38, 0)
+		body.BackgroundTransparency = 1
+		body.Font = Enum.Font.Gotham
+		body.TextSize = 18
+		body.TextWrapped = true
+		body.TextColor3 = Color3.fromRGB(190, 190, 195)
+		body.Text = "You have been kicked from this experience.\n\n"
+			.. "Reason: Exploit detected — unauthorized client modification.\n"
+			.. "This account has been flagged for review.\n\n"
+			.. "Error Code: 267"
+		body.Parent = ban
+
+		task.delay(CONFIG.FakeBanHold, function()
+			pcall(function()
+				LP:Kick("Exploit detected — unauthorized client modification. (Error Code: 267)")
+			end)
+		end)
+	end)
+end
+
+--======================  6. RANDOM SCARE EVENTS  =====================
+local function makePopup(text, duration)
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "HorrorText"
+	gui.IgnoreGuiInset = true
+	gui.ResetOnSpawn = false
+	gui.DisplayOrder = 500
+	gui.Parent = PGui
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(1, 0, 0, 80)
+	label.Position = UDim2.new(0, 0, 0.72, 0)
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.GothamBlack
+	label.TextSize = 40
+	label.TextColor3 = Color3.fromRGB(200, 20, 20)
+	label.TextTransparency = 1
+	label.Text = text
+	label.Parent = gui
+
+	TweenService:Create(label, TweenInfo.new(0.4), { TextTransparency = 0 }):Play()
+	task.delay(duration or 1.6, function()
+		TweenService:Create(label, TweenInfo.new(0.8), { TextTransparency = 1 }):Play()
+		task.wait(0.9)
+		gui:Destroy()
+	end)
+end
+
+local function shakeCamera(intensity, duration)
+	local t = 0
+	local conn
+	conn = RunService.RenderStepped:Connect(function(dt)
+		t += dt
+		if t >= duration then
+			conn:Disconnect()
+			return
+		end
+		local fade = 1 - (t / duration)
+		Camera.CFrame = Camera.CFrame * CFrame.new(
+			(math.random() - 0.5) * intensity * fade,
+			(math.random() - 0.5) * intensity * fade,
+			0
+		)
+	end)
+end
+
+local SCARE_EVENTS = {
+	function() -- whisper
+		local s = newSound(CONFIG.Sounds.Whisper, 2, false, SoundService)
+		s:Play()
+		task.delay(4, function() s:Destroy() end)
+	end,
+
+	function() -- text popup
+		local lines = { "RUN", "BEHIND YOU", "IT SEES YOU", "DON'T LOOK BACK", "GET THE KEY" }
+		makePopup(lines[math.random(1, #lines)], 1.8)
+	end,
+
+	function() -- camera shake
+		shakeCamera(1.4, 0.8)
+	end,
+
+	function() -- relocate a monster right next to you
+		if #Horror.monsters == 0 then return end
+		local m = Horror.monsters[math.random(1, #Horror.monsters)]
+		if m and m.Parent then
+			local pos = randomAroundPlayer(25, 40)
+			if pos then
+				local ground = findGround(pos, { m }) or pos
+				m:PivotTo(CFrame.new(ground + Vector3.new(0, 3, 0)))
+				shakeCamera(0.8, 0.5)
+			end
+		end
+	end,
+
+	function() -- lights out
+		local original = Lighting.Brightness
+		Lighting.Brightness = 0
+		task.wait(1.4)
+		Lighting.Brightness = original
+	end,
+}
+
+--======================  7. GOLD KEY  ================================
+local function spawnKey()
+	local candidates = {}
+	for _, d in ipairs(Workspace:GetDescendants()) do
+		if d:IsA("BasePart")
+			and d.Anchored
+			and d.CanCollide
+			and d.Size.Magnitude > 3
+			and d.Position.Y > -40
+			and d.Position.Y < 800
+		then
+			table.insert(candidates, d)
+		end
+	end
+
+	local key = Instance.new("Part")
+	key.Name         = "GoldKey"
+	key.Size         = Vector3.new(1.2, 1.2, 0.4)
+	key.BrickColor   = BrickColor.new("Gold")
+	key.Material     = Enum.Material.Neon
+	key.Anchored     = true
+	key.CanCollide   = false
+	key.Shape        = Enum.PartType.Cylinder
+
+	local glow = Instance.new("PointLight")
+	glow.Brightness = 3
+	glow.Range      = 22
+	glow.Color      = Color3.fromRGB(255, 215, 90)
+	glow.Parent     = key
+
+	if #candidates > 0 then
+		local base = candidates[math.random(1, #candidates)]
+		local ground = findGround(base.Position, { key }) or (base.Position + Vector3.new(0, 3, 0))
+		key.CFrame = CFrame.new(ground + Vector3.new(0, 2.5, 0))
+	else
+		-- No usable geometry: drop it somewhere near the player instead
+		local pos = randomAroundPlayer(40, 90) or Vector3.new(0, 20, 0)
+		local ground = findGround(pos, { key }) or pos
+		key.CFrame = CFrame.new(ground + Vector3.new(0, 3, 0))
+	end
+
+	key.Parent = Workspace
+	track(key)
+
+	-- Slow spin so it catches the eye
+	task.spawn(function()
+		while key.Parent and Horror.running do
+			key.CFrame = key.CFrame * CFrame.Angles(0, math.rad(2), 0)
+			task.wait(0.03)
+		end
+	end)
+
+	return key
+end
+
+--======================  8. SHUTDOWN  ================================
+local function stopHorror(survived)
+	if not Horror.running and not survived then return end
+	Horror.running = false
+
+	-- Restore lighting
+	local b = Horror.lightingBackup
+	if b.ClockTime then
+		Lighting.ClockTime      = b.ClockTime
+		Lighting.Brightness     = b.Brightness
+		Lighting.FogEnd         = b.FogEnd
+		Lighting.FogStart       = b.FogStart
+		Lighting.Ambient        = b.Ambient
+		Lighting.OutdoorAmbient = b.OutdoorAmbient
+	end
+
+	for _, inst in ipairs(Horror.instances) do
+		pcall(function()
+			if inst and inst.Parent then inst:Destroy() end
+		end)
+	end
+	Horror.instances = {}
+	Horror.monsters  = {}
+
+	if survived then
+		local gui = Instance.new("ScreenGui")
+		gui.IgnoreGuiInset = true
+		gui.Parent = PGui
+
+		local label = Instance.new("TextLabel")
+		label.Size = UDim2.fromScale(1, 1)
+		label.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+		label.BackgroundTransparency = 1
+		label.Font = Enum.Font.GothamBlack
+		label.TextSize = 46
+		label.TextColor3 = Color3.fromRGB(255, 215, 90)
+		label.Text = "YOU ESCAPED"
+		label.TextTransparency = 1
+		label.Parent = gui
+
+		TweenService:Create(label, TweenInfo.new(1), { TextTransparency = 0 }):Play()
+		task.delay(3, function()
+			TweenService:Create(label, TweenInfo.new(1), { TextTransparency = 1 }):Play()
+			task.wait(1.2)
+			gui:Destroy()
+		end)
+	end
+end
+
+--======================  9. MAIN LOOP  ===============================
+local function start()
+	applyAtmosphere()
+	startAmbience()
+	giveFlashlight()
+
+	for i = 1, CONFIG.MonsterCount do
+		local id = CONFIG.MonsterUserIds[((i - 1) % #CONFIG.MonsterUserIds) + 1]
+		local m  = spawnMonster(id)
+		if m then table.insert(Horror.monsters, m) end
+	end
+
+	local key = spawnKey()
+	task.delay(CONFIG.KeyHintDelay, function()
+		if Horror.running then
+			makePopup("A GOLD KEY HAS APPEARED SOMEWHERE", 3)
+		end
+	end)
+
+	-- Heartbeat: monster AI, key pickup, proximity audio
+	local monsterAccum = 0
+	RunService.Heartbeat:Connect(function(dt)
+		if not Horror.running then return end
+
+		monsterAccum += dt
+		if monsterAccum < 0.15 then return end
+		monsterAccum = 0
+
+		local char = LP.Character
+		local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+		if not hrp then return end
+
+		local nearest = math.huge
+
+		for _, m in ipairs(Horror.monsters) do
+			if not m.Parent then continue end
+			local root = m.PrimaryPart or m:FindFirstChild("HumanoidRootPart")
+			local hum  = m:FindFirstChildOfClass("Humanoid")
+			if not root then continue end
+
+			local dist = (root.Position - hrp.Position).Magnitude
+			nearest = math.min(nearest, dist)
+
+			if dist > CONFIG.RespawnDistance then
+				relocateMonster(m)
+			elseif dist < CONFIG.MonsterSightRange and hum then
+				hum:MoveTo(hrp.Position)
+			end
+
+			if dist <= CONFIG.CatchDistance then
+				triggerCatch()
+				return
+			end
+		end
+
+		-- Proximity heartbeat + static
+		if Horror.heartbeat then
+			local t = math.clamp(1 - (nearest / 60), 0, 1)
+			Horror.heartbeat.Volume = t * 1.6
+		end
+		for _, m in ipairs(Horror.monsters) do
+			local s = m:GetAttribute("StaticSound")
+			if s and s.Parent then
+				local root = m.PrimaryPart or m:FindFirstChild("HumanoidRootPart")
+				if root then
+					local d = (root.Position - hrp.Position).Magnitude
+					s.Volume = math.clamp(1 - (d / 45), 0, 1) * 1.8
+				end
+			end
+		end
+
+		-- Key pickup
+		if key and key.Parent then
+			if (key.Position - hrp.Position).Magnitude <= 5 then
+				local chime = newSound(CONFIG.Sounds.Chime, 2, false, SoundService)
+				chime:Play()
+				stopHorror(true)
+			end
+		end
+	end)
+
+	-- Random flicker events
+	task.spawn(function()
+		while Horror.running do
+			task.wait(CONFIG.FlickerMin + math.random() * (CONFIG.FlickerMax - CONFIG.FlickerMin))
+			if not Horror.running then break end
+			local original = Lighting.Brightness
+			for _ = 1, math.random(3, 7) do
+				Lighting.Brightness = math.random() > 0.5 and 0 or original
+				task.wait(math.random(4, 12) / 100)
+			end
+			Lighting.Brightness = original
+		end
+	end)
+
+	-- Random scare events
+	task.spawn(function()
+		while Horror.running do
+			task.wait(CONFIG.ScareMin + math.random() * (CONFIG.ScareMax - CONFIG.ScareMin))
+			if not Horror.running then break end
+			local fn = SCARE_EVENTS[math.random(1, #SCARE_EVENTS)]
+			pcall(fn)
+		end
+	end)
+
+	-- If the player respawns, hand them a new flashlight
+	LP.CharacterAdded:Connect(function()
+		if not Horror.running then return end
+		task.wait(1)
+		giveFlashlight()
+	end)
+end
+
+start()
